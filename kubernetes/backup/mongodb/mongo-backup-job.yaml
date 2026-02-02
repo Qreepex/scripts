@@ -1,0 +1,230 @@
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: mongodb-backup # Change this to match your backup name (e.g., mongodb-myapp-backup)
+  namespace: mongodb # Change this to your namespace
+spec:
+  schedule: "0 */12 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 1200
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: backup
+              image: mongo:7.0.14
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -e
+
+                  # Install AWS CLI and utilities
+                  apt-get update -qq
+                  apt-get install -y -qq awscli coreutils zstd > /dev/null
+
+                  TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+                  BACKUP_DIR="/tmp/mongodb_${TIMESTAMP}"
+                  BACKUP_FILE="mongodb_${TIMESTAMP}.tar.zst"
+
+                  echo "[$(date)] Starting MongoDB backup..."
+
+                  # Create MongoDB backup with mongodump
+                  if [ ! -z "${MONGO_PASSWORD}" ]; then
+                    # With authentication
+                    mongodump \
+                      --host=${MONGO_HOST} \
+                      --port=${MONGO_PORT:-27017} \
+                      --username=${MONGO_USER} \
+                      --password=${MONGO_PASSWORD} \
+                      --authenticationDatabase=${MONGO_AUTH_DB:-admin} \
+                      --db=${MONGO_DATABASE} \
+                      --out=${BACKUP_DIR} \
+                      --gzip
+                  else
+                    # Without authentication
+                    mongodump \
+                      --host=${MONGO_HOST} \
+                      --port=${MONGO_PORT:-27017} \
+                      --db=${MONGO_DATABASE} \
+                      --out=${BACKUP_DIR} \
+                      --gzip
+                  fi
+
+                  # Compress backup to tar.zst
+                  cd /tmp
+                  tar --zstd -cf ${BACKUP_FILE} mongodb_${TIMESTAMP}/
+
+                  BACKUP_SIZE=$(du -h ${BACKUP_FILE} | cut -f1)
+                  echo "[$(date)] Backup created: ${BACKUP_FILE} (${BACKUP_SIZE})"
+
+                  # Upload to S3
+                  aws s3 cp ${BACKUP_FILE} \
+                    s3://${S3_BUCKET}/backups/${BACKUP_FILE} \
+                    --endpoint-url ${S3_ENDPOINT}
+
+                  echo "[$(date)] Backup uploaded successfully"
+
+                  # Clean up local backup
+                  rm -rf ${BACKUP_DIR} ${BACKUP_FILE}
+
+                  # ===== INTELLIGENT RETENTION CLEANUP =====
+                  echo "[$(date)] Starting retention cleanup..."
+
+                  NOW=$(date +%s)
+                  SEVEN_DAYS_AGO=$((NOW - 7*86400))
+                  THIRTY_DAYS_AGO=$((NOW - 30*86400))
+                  NINETY_DAYS_AGO=$((NOW - 90*86400))
+
+                  BACKUP_LIST="/tmp/backup_list.txt"
+
+                  # List all backups
+                  aws s3 ls s3://${S3_BUCKET}/backups/ \
+                    --endpoint-url ${S3_ENDPOINT} | \
+                    awk '{print $4}' | \
+                    grep -E '^mongodb_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]\.tar\.(gz|zst)$' | \
+                    sort > ${BACKUP_LIST}
+
+                  KEEP_LIST="/tmp/keep_backups.txt"
+                  > ${KEEP_LIST}
+
+                  KEEP_COUNT=0
+                  DELETE_COUNT=0
+
+                  echo "[$(date)] Processing $(wc -l < ${BACKUP_LIST}) backups..."
+
+                  while IFS= read -r FILE; do
+                    if [ -z "$FILE" ]; then
+                      continue
+                    fi
+                    
+                    # Extract date (YYYYMMDD)
+                    FILE_DATE=$(echo "$FILE" | cut -d_ -f2)
+                    
+                    if [ -z "$FILE_DATE" ] || [ ${#FILE_DATE} -ne 8 ]; then
+                      echo "Warning: Could not parse date for ${FILE}"
+                      continue
+                    fi
+                    
+                    # Convert date to epoch
+                    YEAR=${FILE_DATE:0:4}
+                    MONTH=${FILE_DATE:4:2}
+                    DAY=${FILE_DATE:6:2}
+                    FILE_EPOCH=$(date -d "${YEAR}-${MONTH}-${DAY}" +%s 2>/dev/null || echo 0)
+                    
+                    if [ $FILE_EPOCH -eq 0 ]; then
+                      echo "Warning: Invalid date in ${FILE}"
+                      continue
+                    fi
+                    
+                    AGE_DAYS=$(( (NOW - FILE_EPOCH) / 86400 ))
+                    
+                    KEEP=0
+                    
+                    if [ $FILE_EPOCH -gt $SEVEN_DAYS_AGO ]; then
+                      # < 7 days: KEEP all
+                      KEEP=1
+                      REASON="< 7 days"
+                      
+                    elif [ $FILE_EPOCH -gt $THIRTY_DAYS_AGO ]; then
+                      # 7-30 days: Keep only 1 per day
+                      DAY_KEY="${FILE_DATE}"
+                      
+                      if ! grep -q "^${DAY_KEY}$" /tmp/days_7_30.txt 2>/dev/null; then
+                        KEEP=1
+                        REASON="7-30 days (first of day)"
+                        echo "${DAY_KEY}" >> /tmp/days_7_30.txt
+                      else
+                        REASON="7-30 days (duplicate)"
+                      fi
+                      
+                    else
+                      # > 30 days: Keep only 1 per week
+                      WEEK_NUMBER=$(date -d "${YEAR}-${MONTH}-${DAY}" +%Y-W%V 2>/dev/null || echo "")
+                      
+                      if [ ! -z "$WEEK_NUMBER" ]; then
+                        if ! grep -q "^${WEEK_NUMBER}$" /tmp/weeks_30plus.txt 2>/dev/null; then
+                          KEEP=1
+                          REASON="> 30 days (first of week)"
+                          echo "${WEEK_NUMBER}" >> /tmp/weeks_30plus.txt
+                        else
+                          REASON="> 30 days (duplicate)"
+                        fi
+                      fi
+                    fi
+                    
+                    if [ $KEEP -eq 1 ]; then
+                      echo "KEEP: ${FILE} (${AGE_DAYS}d, ${REASON})"
+                      echo "${FILE}" >> ${KEEP_LIST}
+                      KEEP_COUNT=$((KEEP_COUNT + 1))
+                    else
+                      echo "DELETE: ${FILE} (${AGE_DAYS}d, ${REASON})"
+                      aws s3 rm s3://${S3_BUCKET}/backups/${FILE} \
+                        --endpoint-url ${S3_ENDPOINT} || echo "Failed to delete ${FILE}"
+                      DELETE_COUNT=$((DELETE_COUNT + 1))
+                    fi
+                    
+                  done < ${BACKUP_LIST}
+
+                  echo ""
+                  echo "[$(date)] Retention summary:"
+                  echo "  Kept: ${KEEP_COUNT} backups"
+                  echo "  Deleted: ${DELETE_COUNT} backups"
+
+                  # Clean up temp files
+                  rm -f ${BACKUP_LIST} ${KEEP_LIST} /tmp/days_7_30.txt /tmp/weeks_30plus.txt
+
+                  echo "[$(date)] MongoDB backup job completed successfully"
+              env:
+                - name: MONGO_HOST
+                  value: "mongodb.mongodb.svc.cluster.local" # Change to your MongoDB hostname/service
+                - name: MONGO_PORT
+                  value: "27017" # Change if MongoDB is running on a different port
+                - name: MONGO_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: mongodb-backup-s3
+                      key: MONGO_USER
+                - name: MONGO_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: mongodb-backup-s3
+                      key: MONGO_PASSWORD
+                - name: MONGO_AUTH_DB
+                  value: "admin" # Authentication database
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: mongodb-backup-s3
+                      key: AWS_ACCESS_KEY_ID
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: mongodb-backup-s3
+                      key: AWS_SECRET_ACCESS_KEY
+                - name: S3_ENDPOINT
+                  valueFrom:
+                    secretKeyRef:
+                      name: mongodb-backup-s3
+                      key: S3_ENDPOINT
+                - name: S3_BUCKET
+                  valueFrom:
+                    secretKeyRef:
+                      name: mongodb-backup-s3
+                      key: S3_BUCKET
+                - name: MONGO_DATABASE
+                  value: "myapp" # Change to your database name
+              resources:
+                requests:
+                  memory: "256Mi" # MongoDB requires more resources
+                  cpu: "1000m"
+                limits:
+                  memory: "512Mi"
+                  cpu: "2000m"
