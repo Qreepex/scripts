@@ -1,0 +1,12 @@
+[Unit]
+Description=Docker Backup Timer (twice daily)
+Requires=mailserver-backup.service
+
+[Timer]
+# Runs at 02:00 and 14:00
+OnCalendar=02:00
+OnCalendar=14:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

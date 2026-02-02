@@ -1,0 +1,17 @@
+[Unit]
+Description=Docker Container Backup Service
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/backup # Change to your backup directory
+ExecStart=/usr/bin/docker-compose run --rm backup
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=backup
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,17 @@
+services:
+  backup:
+    build: .
+    container_name: docker-backup
+    volumes:
+      - /path/to/your/data:/home/data:ro # Change to your data path
+    environment:
+      - BACKUP_SOURCE=/home/data # Change to match volume path
+      - S3_BUCKET=${S3_BUCKET}
+      - S3_ENDPOINT=${S3_ENDPOINT} # Change to your S3 endpoint (e.g., https://s3.de.io.cloud.ovh.net for OVH)
+      - S3_PATH=backups # Change to your backup path
+
+      - AWS_ACCESS_KEY_ID=${S3_KEY}
+      - AWS_SECRET_ACCESS_KEY=${S3_SECRET}
+
+      - GPG_PASSPHRASE=${GPG_PASSPHRASE}
+    restart: "no"
