@@ -1,0 +1,199 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-backup # Change this to match your backup name (e.g., postgres-myapp-backup)
+  namespace: postgres # Change this to your namespace
+spec:
+  schedule: "0 */12 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 600
+      ttlSecondsAfterFinished: 3600
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: backup
+              image: postgres:18-alpine
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -e
+                  apk add --no-cache aws-cli coreutils
+
+                  TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+                  BACKUP_FILE="postgres_${TIMESTAMP}.sql.gz"
+
+                  echo "[$(date)] Starting backup..."
+
+                  # Create backup
+                  PGPASSWORD="${POSTGRES_PASSWORD}" pg_dump \
+                    -h ${POSTGRES_HOST} \
+                    -U ${POSTGRES_USER} \
+                    -d ${POSTGRES_DB} \
+                    -v \
+                    | gzip > /tmp/${BACKUP_FILE}
+
+                  BACKUP_SIZE=$(du -h /tmp/${BACKUP_FILE} | cut -f1)
+                  echo "[$(date)] Backup created: ${BACKUP_FILE} (${BACKUP_SIZE})"
+
+                  # Upload to S3
+                  aws s3 cp /tmp/${BACKUP_FILE} \
+                    s3://${S3_BUCKET}/backups/${BACKUP_FILE} \
+                    --endpoint-url ${S3_ENDPOINT}
+
+                  echo "[$(date)] Backup uploaded successfully"
+
+                  # ===== INTELLIGENT RETENTION LOGIC =====
+                  echo "[$(date)] Starting retention cleanup..."
+
+                  NOW=$(date +%s)
+                  THIRTY_DAYS_AGO=$((NOW - 30*86400))
+                  NINETY_DAYS_AGO=$((NOW - 90*86400))
+
+                  # Temporary file for backup list
+                  BACKUP_LIST="/tmp/backup_list.txt"
+
+                  # List all backups and sort them
+                  aws s3 ls s3://${S3_BUCKET}/backups/ \
+                    --endpoint-url ${S3_ENDPOINT} | \
+                    awk '{print $4}' | \
+                    grep -E '^postgres_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]\.sql\.gz$' | \
+                    sort > ${BACKUP_LIST}
+
+                  # Simulate associative arrays with files
+                  KEEP_LIST="/tmp/keep_backups.txt"
+                  > ${KEEP_LIST}
+
+                  # Process all backups
+                  KEEP_COUNT=0
+                  DELETE_COUNT=0
+
+                  while IFS= read -r FILE; do
+                    if [ -z "$FILE" ]; then
+                      continue
+                    fi
+                    
+                    # Extract date (Format: postgres_YYYYMMDD_HHMMSS.sql.gz)
+                    FILE_DATE=$(echo "$FILE" | cut -d_ -f2)
+                    
+                    if [ -z "$FILE_DATE" ] || [ ${#FILE_DATE} -ne 8 ]; then
+                      echo "Warning: Could not parse date for ${FILE}"
+                      continue
+                    fi
+                    
+                    # Convert date to epoch
+                    YEAR=${FILE_DATE:0:4}
+                    MONTH=${FILE_DATE:4:2}
+                    DAY=${FILE_DATE:6:2}
+                    FILE_EPOCH=$(date -d "${YEAR}-${MONTH}-${DAY}" +%s 2>/dev/null || echo 0)
+                    
+                    if [ $FILE_EPOCH -eq 0 ]; then
+                      echo "Warning: Could not parse date for ${FILE}"
+                      continue
+                    fi
+                    
+                    AGE_DAYS=$(( (NOW - FILE_EPOCH) / 86400 ))
+                    
+                    # Decision logic
+                    KEEP=0
+                    
+                    if [ $FILE_EPOCH -gt $THIRTY_DAYS_AGO ]; then
+                      # Younger than 30 days: KEEP all
+                      KEEP=1
+                      REASON="< 30 days"
+                      
+                    elif [ $FILE_EPOCH -gt $NINETY_DAYS_AGO ]; then
+                      # 30-90 days: Keep only 1 per day (first backup of the day)
+                      DAY_KEY="${FILE_DATE}"
+                      
+                      if ! grep -q "^${DAY_KEY}$" /tmp/days_30_90.txt 2>/dev/null; then
+                        KEEP=1
+                        REASON="30-90 days (first of day)"
+                        echo "${DAY_KEY}" >> /tmp/days_30_90.txt
+                      else
+                        REASON="30-90 days (duplicate day)"
+                      fi
+                      
+                    else
+                      # Older than 90 days: Keep only 1 per week
+                      WEEK_NUMBER=$(date -d "${YEAR}-${MONTH}-${DAY}" +%Y-W%V 2>/dev/null || echo "")
+                      
+                      if [ ! -z "$WEEK_NUMBER" ]; then
+                        if ! grep -q "^${WEEK_NUMBER}$" /tmp/weeks_90plus.txt 2>/dev/null; then
+                          KEEP=1
+                          REASON="> 90 days (first of week)"
+                          echo "${WEEK_NUMBER}" >> /tmp/weeks_90plus.txt
+                        else
+                          REASON="> 90 days (duplicate week)"
+                        fi
+                      fi
+                    fi
+                    
+                    if [ $KEEP -eq 1 ]; then
+                      echo "KEEP: ${FILE} (${AGE_DAYS} days old, ${REASON})"
+                      echo "${FILE}" >> ${KEEP_LIST}
+                      KEEP_COUNT=$((KEEP_COUNT + 1))
+                    else
+                      echo "DELETE: ${FILE} (${AGE_DAYS} days old, ${REASON})"
+                      aws s3 rm s3://${S3_BUCKET}/backups/${FILE} \
+                        --endpoint-url ${S3_ENDPOINT} || echo "Failed to delete ${FILE}"
+                      DELETE_COUNT=$((DELETE_COUNT + 1))
+                    fi
+                    
+                  done < ${BACKUP_LIST}
+
+                  echo ""
+                  echo "[$(date)] Retention summary:"
+                  echo "  Kept: ${KEEP_COUNT} backups"
+                  echo "  Deleted: ${DELETE_COUNT} backups"
+
+                  # Cleanup temp files
+                  rm -f ${BACKUP_LIST} ${KEEP_LIST} /tmp/days_30_90.txt /tmp/weeks_90plus.txt
+
+                  echo "[$(date)] Retention cleanup completed"
+                  echo "[$(date)] Backup job completed"
+              env:
+                - name: POSTGRES_HOST
+                  value: "postgres.default.svc.cluster.local" # Change to your PostgreSQL hostname/service
+                - name: POSTGRES_USER
+                  value: "postgres" # Change if your DB user is different
+                - name: POSTGRES_DB
+                  value: "myapp" # Change to your database name
+                - name: POSTGRES_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: postgres-backup-s3
+                      key: POSTGRES_PASSWORD
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: postgres-backup-s3
+                      key: AWS_ACCESS_KEY_ID
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: postgres-backup-s3
+                      key: AWS_SECRET_ACCESS_KEY
+                - name: S3_ENDPOINT
+                  valueFrom:
+                    secretKeyRef:
+                      name: postgres-backup-s3
+                      key: S3_ENDPOINT
+                - name: S3_BUCKET
+                  valueFrom:
+                    secretKeyRef:
+                      name: postgres-backup-s3
+                      key: S3_BUCKET
+              resources:
+                requests:
+                  memory: "128Mi"
+                  cpu: "100m"
+                limits:
+                  memory: "256Mi"
+                  cpu: "200m"
